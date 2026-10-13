@@ -17,7 +17,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel, Field, model_validator
@@ -445,9 +445,92 @@ def punch_out(body: PunchOutIn):
     return record_out(updated)
 
 
+class RegularizeIn(BaseModel):
+    # Derived fields (work_hours, late_minutes, ...) are not declared, so they are ignored.
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def no_explicit_nulls(self):
+        for name in ("status", "punch_in", "punch_out"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} can not be null")
+        return self
+
+
+TRACKED_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
+
+
+def current_values(rec: dict) -> dict:
+    """The tracked fields of a stored record, with the documented defaults for gaps."""
+    return {
+        "status": rec["status"],
+        "punch_in": as_utc(rec.get("punch_in")),
+        "punch_out": as_utc(rec.get("punch_out")),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": bool(rec.get("half_day", False)),
+    }
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, body: RegularizeIn, record_date: Annotated[str, Path(alias="date")]):
+    validate_date_param(record_date, "date")
+    emp = get_employee_or_404(emp_code)
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": record_date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+    old = current_values(rec)
+
+    status = body.status or old["status"]
+    if status in ABSENCE_STATUSES:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise unprocessable(f"{status} clears both punch times; do not send punch_in/punch_out")
+        new_in, new_out = None, None
+    else:
+        new_in = ms_to_dt(body.punch_in) if body.punch_in is not None else old["punch_in"]
+        new_out = ms_to_dt(body.punch_out) if body.punch_out is not None else old["punch_out"]
+        if new_in is None:
+            raise unprocessable(f"status {status} requires a punch_in", ("body", "punch_in"))
+        if attendance_date(new_in, emp) != record_date:
+            raise unprocessable("punch_in must stay on the record's attendance date", ("body", "punch_in"))
+        if new_out is not None and not (new_in < new_out <= new_in + MAX_SHIFT):
+            raise unprocessable("punch_out must be after punch_in and within 24 hours", ("body", "punch_out"))
+
+    new = {"status": status, "punch_in": new_in, "punch_out": new_out,
+           **derived_fields(status, new_in, new_out, record_date, emp)}
+    changes = {f: {"from": old[f], "to": new[f]} for f in TRACKED_FIELDS if old[f] != new[f]}
+    if not changes:
+        raise unprocessable("the request does not change anything")
+
+    entry = {"at": datetime.now(timezone.utc), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    # Optimistic concurrency: the update only applies if the record still has the values
+    # (and the number of history entries) we read. A concurrent editor that got there
+    # first makes this match nothing -> 409, so no history entry is silently lost.
+    guard = {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, len(rec.get("history") or [])]},
+    }
+    updated = db.attendance_logs.find_one_and_update(
+        guard,
+        {"$set": new, "$push": {"history": entry}},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "the record was changed concurrently; retry")
+    return record_out(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
