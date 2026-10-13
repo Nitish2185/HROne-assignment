@@ -8,23 +8,76 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from pymongo import MongoClient
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
+from pymongo.errors import PyMongoError
 
-load_dotenv()
+# override=False (the default): real environment variables win over the .env file.
+load_dotenv(override=False)
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+# tz_aware=True: PyMongo hands back timezone-aware UTC datetimes instead of naive ones.
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+    tzinfo=timezone.utc,
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+log = logging.getLogger("attendance")
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+# --------------------------------------------------------------------------- #
+# Indexes (created at startup, idempotently - create_indexes is a no-op when an
+# identical index already exists)
+# --------------------------------------------------------------------------- #
+EMPLOYEE_INDEXES = [
+    # emp_code is the business key: uniqueness is what makes concurrent creates safe.
+    IndexModel([("emp_code", ASCENDING)], unique=True, name="uniq_emp_code"),
+    # GET /employees?department=..., sorted by emp_code; also the trend's $match.
+    IndexModel([("department", ASCENDING), ("emp_code", ASCENDING)], name="department_emp_code"),
+    # Department summary: employees who joined on or before the end of the month.
+    IndexModel([("joined_on", ASCENDING)], name="joined_on"),
+]
+
+ATTENDANCE_INDEXES = [
+    # One record per (emp_code, date): makes punch-in race-safe; also serves every
+    # per-employee lookup ($lookup in analytics, /attendance?emp_code=...).
+    IndexModel([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uniq_emp_code_date"),
+    # GET /attendance default sort (date desc, emp_code asc) and month-range analytics.
+    IndexModel([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_desc_emp_code"),
+    # GET /attendance?status=... (equality, then sort).
+    IndexModel([("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)], name="status_date_emp_code"),
+    # Punch-out: the employee's latest record with punch_in <= punched_at.
+    IndexModel([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_code_punch_in"),
+]
+
+
+def ensure_indexes() -> None:
+    db.employees.create_indexes(EMPLOYEE_INDEXES)
+    db.attendance_logs.create_indexes(ATTENDANCE_INDEXES)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        ensure_indexes()
+    except PyMongoError as exc:  # keep starting; /health reports 503 until MongoDB answers
+        log.error("could not create indexes at startup: %s", exc)
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +124,10 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except PyMongoError:
+        return JSONResponse(status_code=503, content={"detail": "MongoDB is not reachable"})
     return {"status": "ok"}
 
 
