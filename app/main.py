@@ -530,8 +530,97 @@ def regularize_attendance(emp_code: str, body: RegularizeIn, record_date: Annota
 
 
 # --------------------------------------------------------------------------- #
+# Analytics - shared aggregation expressions. They read the stored derived values
+# (never recompute them from punch times) and treat missing fields as their defaults.
+# --------------------------------------------------------------------------- #
+Month = Annotated[str, Query(pattern=MONTH_PATTERN)]
+
+
+def weekday_expr(date_field: str) -> dict:
+    """True when a YYYY-MM-DD string falls on Mon-Fri (R7)."""
+    day = {"$dateFromString": {"dateString": date_field, "format": "%Y-%m-%d"}}
+    return {"$lte": [{"$isoDayOfWeek": day}, 5]}
+
+
+IS_PRESENT = {"$in": ["$status", list(PRESENCE_STATUSES)]}
+# R5/R6: a presence record is worth 1, or 0.5 when it is a half day.
+PRESENCE_VALUE = {"$cond": [IS_PRESENT, {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]}, 0]}
+# present_days only counts Mon-Fri records (R7).
+PRESENT_DAY_VALUE = {"$cond": [weekday_expr("$date"), PRESENCE_VALUE, 0]}
+LATE_MINUTES = {"$ifNull": ["$late_minutes", 0]}
+IS_LATE = {"$gt": [LATE_MINUTES, 0]}
+
+
+def count_if(condition) -> dict:
+    return {"$sum": {"$cond": [condition, 1, 0]}}
+
+
+def round_half_up_expr(expr, places: int) -> dict:
+    """R8 inside the pipeline: Decimal128 arithmetic, then floor(x * 10^n + 0.5) / 10^n.
+    ($round is banker's rounding.) Null in, null out."""
+    scale = 10 ** places
+    scaled = {"$multiply": [{"$toDecimal": expr}, scale]}
+    return {"$toDouble": {"$divide": [{"$floor": {"$add": [scaled, 0.5]}}, scale]}}
+
+
+def month_bounds(month: str) -> tuple[str, str]:
+    first = date.fromisoformat(f"{month}-01")
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return first.isoformat(), (nxt - timedelta(days=1)).isoformat()
+
+
+def count_working_days(start: date, end: date) -> int:
+    """Mon-Fri days in [start, end] (R7); 0 when start > end."""
+    if start > end:
+        return 0
+    days = (end - start).days + 1
+    full_weeks, rest = divmod(days, 7)
+    return full_weeks * 5 + sum(1 for i in range(rest) if (start + timedelta(days=i)).weekday() < 5)
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    first, last = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first, "$lte": last}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": PRESENT_DAY_VALUE},
+            "leave_days": count_if({"$eq": ["$status", "LEAVE"]}),
+            "late_count": count_if(IS_LATE),
+            "total_late_minutes": {"$sum": LATE_MINUTES},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: Month):
+    emp = get_employee_or_404(emp_code)
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)))
+    stats = rows[0] if rows else {}
+
+    first, last = month_bounds(month)
+    joined = date.fromisoformat(emp["joined_on"])
+    working_days = count_working_days(max(date.fromisoformat(first), joined), date.fromisoformat(last))
+    present_days = stats.get("present_days", 0)
+    pct = None
+    if working_days:
+        pct = round_half_up(Decimal(str(present_days)) * 100 / Decimal(working_days), 2)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present_days, 2),
+        "leave_days": stats.get("leave_days", 0),
+        "late_count": stats.get("late_count", 0),
+        "total_late_minutes": stats.get("total_late_minutes", 0),
+        "total_overtime_minutes": stats.get("total_overtime_minutes", 0),
+        "attendance_pct": pct,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
