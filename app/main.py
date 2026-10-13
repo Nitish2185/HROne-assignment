@@ -266,8 +266,40 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMs] = None
+    status: PresenceStatus = "PRESENT"
+
+
+def history_out(entry: dict) -> dict:
+    changes = {}
+    for field, change in (entry.get("changes") or {}).items():
+        if field in ("punch_in", "punch_out"):
+            change = {"from": dt_to_ms(change.get("from")), "to": dt_to_ms(change.get("to"))}
+        changes[field] = change
+    return {"at": dt_to_ms(entry.get("at")), "by": entry.get("by"), "reason": entry.get("reason"), "changes": changes}
+
+
+def record_out(doc: dict) -> dict:
+    """Stored record -> API shape: no _id, epoch ms instants, defaults for legacy gaps."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": dt_to_ms(doc.get("punch_in")),
+        "punch_out": dt_to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day", False)),
+        "history": [history_out(h) for h in doc.get("history") or []],
+    }
+
+
+def get_employee_or_404(emp_code: str) -> dict:
+    emp = db.employees.find_one({"emp_code": emp_code}, {"_id": 0})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    return emp
 
 
 # --------------------------------------------------------------------------- #
@@ -311,27 +343,25 @@ def list_employees(department: Optional[str] = None, page: Page = 1, page_size: 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    emp = get_employee_or_404(body.emp_code)
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc_seconds()
+    d = attendance_date(ts, emp)
     doc = {
         "emp_code": body.emp_code,
         "date": d,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
-        "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, d, emp),
-        "overtime_minutes": 0,
-        "half_day": False,
+        **derived_fields(body.status, ts, None, d, emp),
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        # The unique (emp_code, date) index is the only arbiter: of N simultaneous
+        # inserts exactly one succeeds, the rest raise DuplicateKeyError.
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return record_out(doc)
 
 
 @app.get("/attendance")
