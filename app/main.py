@@ -1,12 +1,13 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
+Env:  MONGO_URI, MONGO_DB (real environment variables win over a local .env)
 
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+Contract: openapi.yaml (endpoints, rules R1-R10). Storage: DATA_MODEL.md.
+Layout of this file: config + indexes, rule helpers (R1-R5), employees, attendance
+(punch-in/out, list, regularize), analytics pipelines, admin explain.
+Fixes to the original starter are listed in REVIEW.md.
 """
 import json
 import logging
@@ -68,16 +69,21 @@ ATTENDANCE_INDEXES = [
 ]
 
 
+_indexes_ready = False
+
+
 def ensure_indexes() -> None:
+    global _indexes_ready
     db.employees.create_indexes(EMPLOYEE_INDEXES)
     db.attendance_logs.create_indexes(ATTENDANCE_INDEXES)
+    _indexes_ready = True
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     try:
         ensure_indexes()
-    except PyMongoError as exc:  # keep starting; /health reports 503 until MongoDB answers
+    except PyMongoError as exc:  # keep starting; /health retries and reports 503 meanwhile
         log.error("could not create indexes at startup: %s", exc)
     yield
 
@@ -311,6 +317,8 @@ def get_employee_or_404(emp_code: str) -> dict:
 def health():
     try:
         client.admin.command("ping")
+        if not _indexes_ready:  # MongoDB was unreachable at startup
+            ensure_indexes()
     except PyMongoError:
         return JSONResponse(status_code=503, content={"detail": "MongoDB is not reachable"})
     return {"status": "ok"}
