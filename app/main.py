@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel, Field, model_validator
-from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # override=False (the default): real environment variables win over the .env file.
@@ -407,9 +407,46 @@ def list_attendance(
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = get_employee_or_404(body.emp_code)
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc_seconds()
+    # Most recent record that started at or before this punch-out; works across midnight
+    # because it is found by instant, not by calendar date.
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    started = as_utc(rec["punch_in"])
+    if ts <= started:
+        raise unprocessable("punched_at must be after punch_in", ("body", "punched_at"))
+    if ts - started > MAX_SHIFT:
+        raise unprocessable("punched_at must be within 24 hours of punch_in", ("body", "punched_at"))
+
+    fields = {"punch_out": ts, **derived_fields(rec["status"], started, ts, rec["date"], emp)}
+    # Conditional update: only the request that still sees punch_out == null wins.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": fields},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return record_out(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
