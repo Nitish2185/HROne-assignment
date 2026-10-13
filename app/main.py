@@ -688,9 +688,53 @@ def department_summary(month: Month, department: Optional[str] = None):
     return {"month": month, "items": items}
 
 
+LeaderboardLimit = Annotated[int, Query(ge=1, le=50)]
+
+
+def late_leaderboard_pipeline(month: str, limit: int, department: Optional[str]) -> list:
+    first, last = month_bounds(month)
+    pipeline = [
+        {"$match": {"date": {"$gte": first, "$lte": last}, "late_minutes": {"$gt": 0}}},
+        {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
+        # Inner join: logs whose employee does not exist are dropped before ranking.
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "pipeline": [{"$project": {"_id": 0, "name": 1, "department": 1}}],
+            "as": "emp",
+        }},
+        {"$unwind": "$emp"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})  # rank inside the department
+    pipeline += [
+        # $rank is standard competition ranking: ties share a rank, the next one is skipped.
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        # limit applies to the rank, not to the number of rows, so ties at the cutoff all stay.
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": "$rank",
+            "emp_code": "$_id",
+            "name": "$emp.name",
+            "department": "$emp.department",
+            "total_late_minutes": "$total_late_minutes",
+            "late_count": "$late_count",
+        }},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month: Month, limit: LeaderboardLimit = 10, department: Optional[str] = None):
+    items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
