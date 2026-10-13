@@ -8,6 +8,7 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import json
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
@@ -844,6 +846,57 @@ def department_trend(
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Admin - explain. Each endpoint's query is rebuilt by the same function the endpoint
+# uses, so the plan shown is the plan that runs.
 # --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def require(value, name: str):
+    if value is None:
+        raise unprocessable(f"{name} is required for this endpoint", ("query", name))
+    return value
+
+
+def explain_aggregate(collection: str, pipeline: list) -> dict:
+    return db.command("explain", {"aggregate": collection, "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Annotated[Optional[str], Query(pattern=MONTH_PATTERN)] = None,
+    department: Optional[str] = None,
+    limit: LeaderboardLimit = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    trend_from: Annotated[Optional[str], Query(alias="from")] = None,
+    trend_to: Annotated[Optional[str], Query(alias="to")] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        spec = attendance_list_query(emp_code, date_from, date_to, status, page, page_size)
+        command = {"find": collection, "filter": spec["filter"], "sort": dict(spec["sort"]),
+                   "skip": spec["skip"], "limit": spec["limit"], "projection": {"_id": 0}}
+        result = db.command("explain", command, verbosity="executionStats")
+    elif endpoint == "employee_monthly":
+        collection = "attendance_logs"
+        pipeline = employee_monthly_pipeline(require(emp_code, "emp_code"), require(month, "month"))
+        result = explain_aggregate(collection, pipeline)
+    elif endpoint == "department_summary":
+        collection = "employees"
+        result = explain_aggregate(collection, department_summary_pipeline(require(month, "month"), department))
+    elif endpoint == "late_leaderboard":
+        collection = "attendance_logs"
+        result = explain_aggregate(collection, late_leaderboard_pipeline(require(month, "month"), limit, department))
+    else:  # department_trend
+        collection = "employees"
+        start, end = validate_trend_range(trend_from, trend_to)
+        result = explain_aggregate(collection, department_trend_pipeline(require(department, "department"), start, end))
+    # Relaxed Extended JSON turns BSON-only types (Timestamp, ObjectId, dates) into plain JSON.
+    explain = json.loads(json_util.dumps(result, json_options=json_util.RELAXED_JSON_OPTIONS))
+    return {"endpoint": endpoint, "collection": collection, "explain": explain}
