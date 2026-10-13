@@ -10,17 +10,19 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, model_validator
 from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # override=False (the default): real environment variables win over the .env file.
 load_dotenv(override=False)
@@ -201,14 +203,65 @@ def derived_fields(status: str, punch_in, punch_out, date_str: str, emp: dict) -
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+def check_calendar_date(value: str) -> str:
+    date.fromisoformat(value)  # rejects 2026-02-30 etc. (ValueError -> 422)
+    return value
+
+
+DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+HHMM_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+DateStr = Annotated[str, Field(pattern=DATE_PATTERN), AfterValidator(check_calendar_date)]
+HHMM = Annotated[str, Field(pattern=HHMM_PATTERN)]
+Page = Annotated[int, Query(ge=1)]
+PageSize = Annotated[int, Query(ge=1, le=100)]
+
+
+def unprocessable(msg: str, loc: tuple = ("body",)) -> RequestValidationError:
+    """A 422 with FastAPI's default validation body ({"detail": [...]}) for rule checks
+    that can only run after reading the database."""
+    return RequestValidationError([{"type": "value_error", "loc": loc, "msg": msg, "input": None}])
+
+
+def validate_date_param(value: Optional[str], name: str) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if not re.fullmatch(DATE_PATTERN, value):
+            raise ValueError
+        return check_calendar_date(value)
+    except ValueError:
+        raise unprocessable("must be a valid YYYY-MM-DD date", ("query", name))
+
+
+def employee_out(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc.get("name"),
+        "email": doc.get("email"),
+        "department": doc.get("department"),
+        "shift_start": doc.get("shift_start"),
+        "shift_end": doc.get("shift_end"),
+        "joined_on": doc.get("joined_on"),
+        "created_at": dt_to_ms(doc.get("created_at")),
+    }
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: HHMM = "09:30"
+    shift_end: HHMM = "18:30"
+    joined_on: DateStr
+
+    @model_validator(mode="after")
+    def shift_times_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -231,24 +284,29 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc)
+    try:
+        # No find-then-insert: the unique index decides, so concurrent creates get one 201.
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return employee_out(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(department: Optional[str] = None, page: Page = 1, page_size: PageSize = 20):
     q = {}
-    if department:
+    if department is not None:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    total = db.employees.count_documents(q)
+    cursor = (
+        db.employees.find(q, {"_id": 0})
+        .sort("emp_code", ASCENDING)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [employee_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
