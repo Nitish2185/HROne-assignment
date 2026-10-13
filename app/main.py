@@ -619,9 +619,77 @@ def employee_monthly(emp_code: str, month: Month):
     }
 
 
+def department_summary_pipeline(month: str, department: Optional[str]) -> list:
+    """Runs on `employees` so that headcount includes people with zero logs (R9).
+    Each employee pulls in only their own logs for the month through an indexed
+    $lookup on (emp_code, date), pre-aggregated to one row per employee."""
+    first, last = month_bounds(month)
+    match = {"joined_on": {"$lte": last}}
+    if department is not None:
+        match["department"] = department
+    has_hours = {"$and": [IS_PRESENT, {"$isNumber": "$work_hours"}]}
+    return [
+        {"$match": match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [
+                {"$match": {"date": {"$gte": first, "$lte": last}}},
+                {"$group": {
+                    "_id": None,
+                    "present_days": {"$sum": PRESENT_DAY_VALUE},
+                    # Sum + count (not an average) so the department average is over records.
+                    "work_hours_sum": {"$sum": {"$cond": [has_hours, {"$toDecimal": "$work_hours"}, 0]}},
+                    "work_hours_count": count_if(has_hours),
+                    "late_count": count_if(IS_LATE),
+                    "total_late_minutes": {"$sum": LATE_MINUTES},
+                    "leave_count": count_if({"$eq": ["$status", "LEAVE"]}),
+                    "on_duty_count": count_if({"$eq": ["$status", "ON_DUTY"]}),
+                }},
+            ],
+            "as": "stats",
+        }},
+        # Employees with no logs keep their row (stats missing -> $sum treats as 0).
+        {"$unwind": {"path": "$stats", "preserveNullAndEmptyArrays": True}},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": "$stats.present_days"},
+            "work_hours_sum": {"$sum": "$stats.work_hours_sum"},
+            "work_hours_count": {"$sum": "$stats.work_hours_count"},
+            "late_count": {"$sum": "$stats.late_count"},
+            "total_late_minutes": {"$sum": "$stats.total_late_minutes"},
+            "leave_count": {"$sum": "$stats.leave_count"},
+            "on_duty_count": {"$sum": "$stats.on_duty_count"},
+        }},
+        {"$sort": {"_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": "$headcount",
+            "present_days": round_half_up_expr("$present_days", 2),
+            "avg_work_hours": {"$cond": [
+                {"$gt": ["$work_hours_count", 0]},
+                round_half_up_expr({"$divide": ["$work_hours_sum", "$work_hours_count"]}, 2),
+                None,
+            ]},
+            "late_count": "$late_count",
+            "total_late_minutes": "$total_late_minutes",
+            "leave_count": "$leave_count",
+            "on_duty_count": "$on_duty_count",
+        }},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: Month, department: Optional[str] = None):
+    items = list(db.employees.aggregate(department_summary_pipeline(month, department)))
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
