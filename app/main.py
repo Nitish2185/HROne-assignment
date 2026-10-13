@@ -733,8 +733,117 @@ def late_leaderboard(month: Month, limit: LeaderboardLimit = 10, department: Opt
     return {"month": month, "items": items}
 
 
+MAX_TREND_DAYS = 92
+
+
+def validate_trend_range(date_from: Optional[str], date_to: Optional[str]) -> tuple[str, str]:
+    if date_from is None or date_to is None:
+        raise unprocessable("from and to are required", ("query", "from" if date_from is None else "to"))
+    start = validate_date_param(date_from, "from")
+    end = validate_date_param(date_to, "to")
+    if end < start:
+        raise unprocessable("to must be on or after from", ("query", "to"))
+    if (date.fromisoformat(end) - date.fromisoformat(start)).days + 1 > MAX_TREND_DAYS:
+        raise unprocessable(f"the range can not exceed {MAX_TREND_DAYS} days", ("query", "to"))
+    return start, end
+
+
+def department_trend_pipeline(department: str, start: str, end: str) -> list:
+    """One row per calendar day in [start, end], computed entirely in MongoDB.
+
+    Each employee of the department emits "events": +1 headcount on the day they join
+    (or on `start` if they joined earlier) and one event per log in the range. Events are
+    summed per day, missing days are created with $densify, and a running sum turns the
+    join events into the headcount of each day (R9)."""
+    end_exclusive = datetime.combine(date.fromisoformat(end) + timedelta(days=1), time(), timezone.utc)
+    as_day = lambda s: {"$dateFromString": {"dateString": s, "format": "%Y-%m-%d", "timezone": "UTC"}}
+    rate = {"$cond": [
+        {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+        round_half_up_expr({"$divide": ["$present_count", "$headcount"]}, 4),
+        None,
+    ]}
+    return [
+        {"$match": {"department": department}},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [
+                {"$match": {"date": {"$gte": start, "$lte": end}}},
+                {"$project": {
+                    "_id": 0,
+                    "date": 1,
+                    "joins": {"$literal": 0},
+                    "present": PRESENCE_VALUE,  # any day of the week
+                    "late": {"$cond": [IS_LATE, 1, 0]},
+                }},
+            ],
+            "as": "log_events",
+        }},
+        {"$project": {"_id": 0, "events": {"$concatArrays": [
+            "$log_events",
+            {"$cond": [
+                {"$lte": ["$joined_on", end]},
+                [{"date": {"$max": ["$joined_on", start]}, "joins": 1, "present": 0, "late": 0}],
+                # Not joined yet: still emit an empty event so $densify always has input.
+                [{"date": start, "joins": 0, "present": 0, "late": 0}],
+            ]},
+        ]}}},
+        {"$unwind": "$events"},
+        {"$group": {
+            "_id": "$events.date",
+            "joins": {"$sum": "$events.joins"},
+            "present_count": {"$sum": "$events.present"},
+            "late_count": {"$sum": "$events.late"},
+        }},
+        {"$set": {"day": as_day("$_id")}},
+        # Gap filling: one document per calendar day, weekends and empty days included.
+        {"$densify": {"field": "day", "range": {
+            "step": 1, "unit": "day", "bounds": [as_utc(datetime.combine(date.fromisoformat(start), time())), end_exclusive],
+        }}},
+        {"$setWindowFields": {
+            "sortBy": {"day": 1},
+            "output": {"headcount": {"$sum": {"$ifNull": ["$joins", 0]}, "window": {"documents": ["unbounded", "current"]}}},
+        }},
+        {"$set": {
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
+        }},
+        {"$set": {"attendance_rate": rate}},
+        # Trailing 7-row window inside the requested range; $avg skips nulls and
+        # returns null when the window holds none.
+        {"$setWindowFields": {
+            "sortBy": {"day": 1},
+            "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, "current"]}}},
+        }},
+        {"$project": {
+            "_id": 0,
+            "date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}},
+            "is_working_day": "$is_working_day",
+            "headcount": "$headcount",
+            "present_count": {"$toDouble": "$present_count"},
+            "late_count": "$late_count",
+            "attendance_rate": "$attendance_rate",
+            "moving_avg_7d": round_half_up_expr("$moving_avg_7d", 4),
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: Annotated[Optional[str], Query(alias="from")] = None,
+    date_to: Annotated[Optional[str], Query(alias="to")] = None,
+):
+    start, end = validate_trend_range(date_from, date_to)
+    if db.employees.find_one({"department": department}, {"_id": 1}) is None:
+        raise HTTPException(404, "unknown department")
+    items = list(db.employees.aggregate(department_trend_pipeline(department, start, end)))
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
