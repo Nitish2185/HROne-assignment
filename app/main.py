@@ -364,17 +364,17 @@ def punch_in(body: PunchInIn):
     return record_out(doc)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-):
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def attendance_list_query(emp_code, date_from, date_to, status, page, page_size) -> dict:
+    """Filter, sort and pagination for GET /attendance (shared with /admin/explain)."""
+    date_from = validate_date_param(date_from, "date_from")
+    date_to = validate_date_param(date_to, "date_to")
+    if date_from and date_to and date_from > date_to:
+        raise unprocessable("date_from must be on or before date_to", ("query", "date_from"))
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
@@ -382,15 +382,29 @@ def list_attendance(
             q["date"]["$gte"] = date_from
         if date_to:
             q["date"]["$lte"] = date_to
-    if status:
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    return {"filter": q, "sort": ATTENDANCE_SORT, "skip": (page - 1) * page_size, "limit": page_size}
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    spec = attendance_list_query(emp_code, date_from, date_to, status, page, page_size)
+    total = db.attendance_logs.count_documents(spec["filter"])
+    cursor = (
+        db.attendance_logs.find(spec["filter"], {"_id": 0})
+        .sort(spec["sort"])
+        .skip(spec["skip"])
+        .limit(spec["limit"])
+    )
+    return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
