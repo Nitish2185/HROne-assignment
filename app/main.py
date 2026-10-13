@@ -755,8 +755,8 @@ def department_trend_pipeline(department: str, start: str, end: str) -> list:
     (or on `start` if they joined earlier) and one event per log in the range. Events are
     summed per day, missing days are created with $densify, and a running sum turns the
     join events into the headcount of each day (R9)."""
-    end_exclusive = datetime.combine(date.fromisoformat(end) + timedelta(days=1), time(), timezone.utc)
-    as_day = lambda s: {"$dateFromString": {"dateString": s, "format": "%Y-%m-%d", "timezone": "UTC"}}
+    lower = datetime.combine(date.fromisoformat(start), time(), timezone.utc)
+    upper = datetime.combine(date.fromisoformat(end) + timedelta(days=1), time(), timezone.utc)  # exclusive
     rate = {"$cond": [
         {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
         round_half_up_expr({"$divide": ["$present_count", "$headcount"]}, 4),
@@ -796,10 +796,10 @@ def department_trend_pipeline(department: str, start: str, end: str) -> list:
             "present_count": {"$sum": "$events.present"},
             "late_count": {"$sum": "$events.late"},
         }},
-        {"$set": {"day": as_day("$_id")}},
+        {"$set": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
         # Gap filling: one document per calendar day, weekends and empty days included.
         {"$densify": {"field": "day", "range": {
-            "step": 1, "unit": "day", "bounds": [as_utc(datetime.combine(date.fromisoformat(start), time())), end_exclusive],
+            "step": 1, "unit": "day", "bounds": [lower, upper],
         }}},
         {"$setWindowFields": {
             "sortBy": {"day": 1},
